@@ -1,0 +1,588 @@
+---
+title: "Untitled"
+author: "YongJunYang"
+date: "2019년 3월 2일"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+### **목차**
+#### 1. 프로젝트 개요
+#### 2. 데이터 수집
+#### 3. 텍스트 마이닝 프로세스
+#### 4. 토픽 모델링, LDA 
+#### 5. 추천시스템 및 결론
+
+
+## **1. 프로젝트 개요**
+### 방대한 데이터들 속에서 유용한 정보를 얻기 위한 분석 방법 중 대표적으로 데이터 마이닝(Data mining)이 있다. 우리는 데이터 마이닝 중 비정형 데이터를 이용한 텍스트 마이닝을 하기로 하였다.
+
+### 영화시장에서는 일반적으로 사람들이 영화를 선택할 때, 네티즌들의 리뷰가 영화를 선택하는데 많은 영향을 미치고 있다. 즉, 네티즌들은 영화를 보기 전 관객들의 반응을 미리 확인하여 조금 더 만족할만한 영화를 선택하여 관람한다. 
+
+### 이번 프로젝트의 목적은 <왓챠플레이> 영화 리뷰를 통해 '토픽 모델링(LDA)'을 하여 기존 27개의 대분류의 장르를 세분화하는 것이다. 또한, 유저들의 리뷰 단어를 통해 세분화한 장르가 얼만큼 분류가 잘 되었는지 확인해보았다. 이를 통해 왓챠플레이의 기존 추천 알고리즘과 다른 유저들의 감성 기반으로 한 알고리즘을 추천시스템으로 만들었다.
+
+
+
+## **2. 데이터 수집**
+### 사용된 데이터 포털 사이트 : 왓챠 플레이
+### 데이터 수집 방법          : 웹 크롤링 
+### 데이터 형태 및 방식       : JSON 형태의 GET 방식
+### 데이터 : 영화이름 / 유저닉네임 / 리뷰 / 별점 / 좋아요 / 생년월일 / 성별 / 작성날짜 / 유저신뢰도 / 팔로워 (총 10개 컬럼)
+### 세부 내용 : 총 27개의 장르, 영화 장르별 리뷰 수의 3분위수, 별점 4.5점 이상
+
+### Library 불러오기 
+```{r}
+library(tidyverse)
+library(rJava)
+library(NLP4kec)
+library(tm)
+library(topicmodels)
+library(LDAvis)
+library(servr)
+library(readr)
+library(slam)
+library(RcppMeCab)
+library(Rmpfr)
+```
+
+### Web Crawling 자동화 
+```{r}
+# user-agent 미리 생성 
+myUA <- 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/72.0.3626.96 Safari/537.36'
+
+# 빈 데이터 프레임 생성
+result <- data.frame()
+
+# 영화 리뷰 수집 함수 
+collect_review <- function(genre) {
+  for(i in 0:20) {
+    if(i == 0) { #처음 20개를 불러오기 위해서는 query에 page가 필요 없습니다
+      res_1 <- GET(url = 'https://play.watcha.net/category.json',
+                   query = list(genre = genre,
+                                sort = '2'),
+                   user_agent(agent = myUA))
+    } else { # 그 이외 페이지는 query에 page가 필요해서 넣어주었습니다
+      res_1 <- GET(url = 'https://play.watcha.net/category.json', 
+                   query = list(genre = genre,
+                                sort = '2',
+                                page = i),
+                   user_agent(agent = myUA))
+    }
+    
+    cat('##############################\n')
+    cat('# 영화 이름, 영화 코드 수집시도 # \n')
+    cat('##############################\n')
+    
+    tryCatch({
+      json <- res_1 %>% content(as = 'text') %>% fromJSON()
+      
+      # 영화이름, 영화코드 수집 후 데이터 프레임 생성
+      movie_name <- json$categories$title 
+      movie_code <- json$categories$code
+      movie <- data.frame(movie_name, movie_code)
+      # factor형으로 되어있기 때문에 character형으로 변경 
+      movie$movie_name <- as.character(movie$movie_name)
+      movie$movie_code <- as.character(movie$movie_code)
+      num <- 0
+    }, error = function(e) cat('-> 에러가 발생했습니다!\n') )
+    
+    # movie의 2번째 열 코드를 for문에 넣어서 각 영화 리뷰가 10만건 이상인지 확인 
+    for(j in movie[, 2]) {
+      num <- num + 1
+      
+      res_2 <- GET(url = str_c('https://play.watcha.net/contents/',j,'.json'),
+                   user_agent(agent = myUA))
+      
+      cat('영화 이름 : (', movie[num, 1],') 수집중 \n')
+      
+      tryCatch({
+        json2 <- res_2 %>% content(as = 'text') %>% fromJSON
+        
+        # 별점 평가한 인원 파악 
+        count <- json2$ratings_count
+        
+        # 해당 영화 인원이 10만 이하면 그냥 건너 뛰고 다음 for문을 이어서 진행합니다
+        if(count < 22292) next
+      
+      }, error = function(e) cat('-> 에러가 발생했습니다!\n'))
+      
+      # 10만건 이상인 영화의 댓글을 수집합니다
+      for(k in 1:1000) {
+        res_3 <- GET(url = str_c('https://play.watcha.net/contents/',j,'/comments.json'),
+                     query = list(page = k),
+                     user_agent(agent = myUA))
+        
+        tryCatch({
+          json3_prev <- res_3 %>% content(as = 'text', encoding = 'UTF-8') %>% fromJSON()
+          json3_next <- json3_prev$comments
+          
+          # 댓글이 없으면 for문 종료
+          if(is.null(json3_next$text)) break
+          
+          # 댓글이 있으면 수집
+          movie_name <- movie$movie_name[num]
+          review     <- json3_next$text
+          likes      <- json3_next$likes_count
+          user_name  <- json3_next$user$name
+          rate       <- json3_next$user_action$rating
+          birth      <- json3_next$user$birthday
+          gender     <- json3_next$user$gender
+          write      <- json3_next$user$created_at
+          confidence <- json3_next$user$confidence
+          follower   <- json3_next$user$followers_count
+          result     <- rbind(result, data.frame(movie_name, user_name, review, rate, likes, 
+                                                 birth, gender, write, confidence, follower))
+          
+          cat('댓글 개수 10만개 이상 수집 시작 영화 이름 : (', movie[num, 1], ')', k, '번째 댓글 수집 완료\n')
+          
+        }, error = function(e) cat('-> 에러가 발생했습니다!\n'))
+        
+        Sys.sleep(0.5)
+      }
+    }
+  }
+  return(result) # 결과 반환
+}
+```
+
+
+### 작업공간 설정하고 데이터 불러오기 
+```{r}
+#setwd("~/Dropbox/personal/winter/MachineLearning/project/final_data/")
+setwd('C:/Users/yyj94/Desktop/머신러닝 프로젝트')
+Sys.setlocale('LC_ALL','C')
+load(file = 'result.RData')
+str(result)
+```
+
+
+## **3. 텍스트 마이닝 프로세스**
+### 텍스트 데이터 전처리 --> 형태소 분석 --> 말뭉치 생성 --> DTM 생성 --> 토픽 모델링
+
+#### 텍스트 데이터 전처리
+```{r}
+# (1) 평점 4.5이상만 추출
+result <- result %>% 
+  dplyr::filter(rate >= 4.5)
+
+# (2) 열명 변경
+rownames(result) <- seq(from = 1, to = nrow(result), by = 1)
+
+# (3) review 타입 변경
+result$review <- as.character(result$review)
+
+```
+
+#### EDA
+##### 리뷰가 가장 많은 영화는?
+```{r}
+result %>% group_by(movie_name) %>% summarise(n = n()) %>%
+  arrange(desc(n)) %>% head(10) %>%
+  ggplot(mapping = aes(x = reorder(movie_name, -n), y = n, fill = movie_name)) +
+  geom_bar(stat = 'identity') +
+  ggtitle('Reviews Top10 Movie') +
+  geom_text(aes(label = n), vjust = -0.1) +
+  xlab("Movie name") + ylab("Review Count")
+
+```
+
+
+#### 별점 5.0점이 가장 많은 영화는?
+```{r}
+result %>% filter(rate >= 5.0) %>% group_by(movie_name) %>% summarise(n = n()) %>% 
+  arrange(desc(n)) %>% head(10) %>% 
+  ggplot(mapping = aes(x = reorder(movie_name, -n), y = n, fill = movie_name)) +
+  geom_bar(stat = 'identity') + xlab("Movie name") + ylab("Review Count") +
+  ggtitle('Movies rated over 4.5?') +
+  theme_light()
+```
+
+
+#### 영화에 별점 4.5점 이상 준 사람은 누구?
+
+```{r}
+# NA값 지우고, rate(별점)>= 4.5이상만 추출, 남녀 구분, 나이 구분.
+# (10대이하~이상: 0, 20대이상:1, 30대이상: 2, 40대이상: 3, 50대이상: 4, 60대 이상 5, 6)
+
+# NA값 제거
+result_na_omited <- na.omit(result)
+result_final <- result_na_omited
+
+# 생년월일 계산해서 나이대 추출
+birth <- str_sub(result_final$birth, 1, 4)
+birth <- as.numeric(birth)
+
+
+# 현재연도에서 생년월일 빼고 1더하기
+result_final$age <- 2019 - birth + 1
+
+result_final$age <- ifelse(result_final$age < 20, 10,
+                          ifelse(result_final$age < 30, 20,
+                             ifelse(result_final$age < 40, 30,
+                                    ifelse(result_final$age < 50, 40,
+                                           ifelse(result_final$age < 60, 50,
+                                                  ifelse(result_final$age < 70, 60, 70))))))
+
+# 나이대를 factor로 만들어주기
+result_final$age <- as.factor(result_final$age)
+```
+
+#### 성별 나이별 시각화
+```{r}
+# result에서 NA값 제거된 데이터 프레임에서  rate 4점이상, not_set지우고, 성별/나이를 그룹화해서 summarise로 집계하기.
+result_final %>%
+  dplyr::filter(gender != 'not_set', rate >= 4.5) %>%
+  group_by(gender, age) %>%
+  summarise(n = n()) %>% 
+  ggplot(mapping = aes(x = age, y = n, fill = gender)) +
+  geom_bar(stat= 'identity', position = 'dodge') +
+  geom_text(aes(label = n), position = position_dodge(width = 0.9), vjust = -0.1) +
+  ggthemes::theme_wsj()
+```
+
+#### 영화에 별점 4.5점 이상 준 사람의 연령대
+```{r}
+result_final %>% group_by(age) %>% summarise(n = n()) %>% 
+  ggplot(mapping = aes(x = age, y = n, fill = age)) +
+  geom_bar(stat = "identity") + xlab("age") + ylab("") +
+  geom_text(aes(label = n), vjust = -0.1) +
+  ggtitle("Age who rated over 4.5") +
+  scale_fill_brewer(palette = "Set2") +
+  ggthemes::theme_wsj()
+```
+
+
+```{r}
+result_final %>% filter(gender != 'not_set') %>% group_by(gender) %>%
+  summarise(n = n()) %>% 
+  ggplot(mapping = aes(x = gender, y = n, fill = gender)) +
+  geom_bar(stat = 'identity') + xlab("gender") + ylab("") +
+  ggtitle("Gender who rated over 4.5") +
+  scale_fill_brewer(palette = 'Set1') +
+  geom_text(aes(label = n), vjust = -0.1) +
+  ggthemes::theme_wsj()
+```
+
+## **3. 텍스트 마이닝 프로세스**
+
+#### 형태소 분석(Parsing)
+```{r}
+# 영화 이름 
+movie <- levels(result$movie_name)
+
+# 최종 담을 데이터
+word <- data.frame()
+
+# 영화마다 리뷰 분석한거 한줄로 만들어줌
+word_split <- function(data) {
+  for(i in 1:length(movie)) {
+    cat(i, '번째 진행중! \n')
+    # 해당 영화 정보 불러오기
+    movie_info <- data %>%
+      dplyr::filter(movie_name == movie[i])
+    
+    # 해당 영화 리뷰가 없다면 무시하고 진행 
+    if(is_empty(is.na.data.frame(movie_info))) next
+    
+    # 해당 영화 리뷰 원하는 품사만 가져오기
+    parse <- pos(movie_info$review, format = 'data.frame') %>% filter(pos %in% c('NNG','VV','VA'))
+    
+    # UTF-8 변경이 필요한 경우
+    if(is_empty(is.na.data.frame(parse))) {
+      parse <- pos(iconv(movie_info$review, to = 'UTF-8'), format = 'data.frame') %>% 
+        filter(pos %in% c('NNG','VV','VA'))
+    }
+    
+    tryCatch({
+      # 리뷰 한줄로 이어 붙이기
+      review <- ''
+      for(j in 1:nrow(parse)) {
+          review <- str_c(review, parse$token[j], ' ')
+      }
+    }, error = function(e) cat('-> 에러가 발생했습니다!\n'))
+    
+    # 뒤에 단어 완성 시켜주는 파싱
+    # ex) 알 -> 알다, 잊 -> 잊다
+    parse2 <- r_parser_r(contentVector = review, language = 'ko')
+    
+    # 데이터 합치기
+    word <- rbind(word, data.frame(movie[i], parse2))
+  }
+  # 데이터 반환
+  return(word)
+}
+
+# locale 변경 
+Sys.setlocale(category = 'LC_ALL', locale = 'korean')
+
+# data 불러오기
+load(file = 'final.RData')
+
+# 구조 확인
+head(word, 20)
+```
+
+#### Document Term Matrix 만들기
+```{r}
+# 불용어 사전
+stopWD <- read.csv(file = 'stopWD.csv', header = TRUE)
+
+# 불용어 사전 확인
+stopWD$stopword
+
+# 말뭉치 만들기 
+corpus <- word$parse2 %>% VectorSource() %>% VCorpus()
+
+# DTM 만들기 
+dtm <- DocumentTermMatrix(x = corpus,
+                         control = list(removeNumbers = TRUE,
+                                        removePunctuation = TRUE,
+                                        stopwords = stopWD$stopword,
+                                        wordLengths =c(2, Inf)))
+
+colnames(dtm) <- trimws(colnames(dtm))
+
+cat('Before : ', dim(dtm)[1], '행', dim(dtm)[2], '열 차원입니다! \n')
+  
+dtm_clean <- removeSparseTerms(dtm, sparse = as.numeric(x = 0.99))
+
+cat('After  : ', dim(dtm_clean)[1], '행', dim(dtm_clean)[2], '열 차원입니다! \n')
+
+m = nrow(word)
+
+dtm_clean$dimnames$Docs <- word$movie.i.[1:m]
+dtm_clean$dimnames$Docs <- as.character(dtm_clean$dimnames$Docs)
+
+# DTM 확인
+inspect(dtm_clean)
+
+check <- apply(dtm_clean, 1, sum) %>% as.data.frame() %>% cbind(word$movie.i.)
+
+check %>% 
+  dplyr::filter(. == 0)
+
+# DTM에서 한 영화의 단어의 개수가 0인것 제외 
+load(file = 'dtm_clean.RData')
+
+# DTM 확인 
+inspect(dtm_clean)
+```
+
+
+## **4. 토픽 모델링, LDA**
+
+#### 적절한 K 값(집단의 개수) 찾기. 
+```{r}
+harmonicMean <- function(logLikelihoods, precision = 2000){
+  llMed <- median(logLikelihoods)
+  as.double(llMed - log(mean(exp(-mpfr(logLikelihoods,
+                                       prec=precision) + llMed))))
+}
+
+seqk <- seq(18, 22, 1)
+burnin <- 1000
+iter <- 1000
+keep <- 50
+
+#fitted_many <- lapply(seqk, function(k) LDA(dtm_clean,
+#                                            k=k,
+#                                            method="Gibbs",
+#                                            control=list(burnin=burnin, iter=iter, keep=keep)))
+
+#logLiks_many <- lapply(fitted_many, function(L) L@logLiks[-c(1:(burnin/keep))])
+
+#hm_many <- sapply(logLiks_many, function(h) harmonicMean(h))
+
+# ggplot(data.frame(seqk, hm_many), aes(x = seqk, y = hm_many)) + geom_path(lwd = 1.5) +
+#   theme(text = element_text(family = NULL),
+#         axis.title.y = element_text(vjust = 1, size = 16),
+#         axis.title.x = element_text(vjust = -.5, size = 16),
+#         axis.text = element_text(size = 16),
+#         plot.title = element_text(size = 20)) +
+#   xlab('Number of Topics') +
+#   ylab('Harmonic Mean') +
+#   ylim(-1400000, -1350000)+
+#   ggplot2::annotate('text', x = 9, y = 199000,
+#                     label = paste("The optimal number of topics is", seqk[which.max(hm_many)])) +
+#   labs(title = "Latent Dirichlet Allocation Analysis", subtitle = "How many distinct topics?")
+```
+
+#### 불용어 사전을 만들기 위한 토픽 추출 함수 
+```{r}
+topic_LDA <- function(data, k) {
+  
+  # tf-idf 가중치 계산하기
+  term_tfidf = tapply(dtm$v / row_sums(dtm)[dtm$i], dtm$j, mean) * log2(nDocs(dtm) / col_sums(dtm > 0))
+  
+  # 인자값
+  control_LDA_Gibbs = list(# TopicModelcontrol 
+    seed          = 100, # 같은 결과 값이 나오게하는 임의의 난수 생성
+    verbose       = 0,   # 값이 양의 정수이면 진행 마다 진행률이 나타나고 0이면 나타나지 않는다
+    save          = 0,   # 값이 양의 정수이면 진행 마다 모델이 저장되고 0이면 저장되지 않는다
+    prefix        = tempfile(), # 중간결과를 저장할 장소
+    nstart        = 1,   # 반복이 시작되는 숫자
+    best          = TRUE, # TRUE이면 사후최대 가능도를 반환
+    keep          = 0,   # 값이 양의 정수이면 진행 마다 로그-가능도가 매 반복마다 저장된다
+    estimate.beta = TRUE, # 주제가 정해져있으면 FALSE, 주제가 정해져있지 않으면 TRUE
+    # LDAcontrol
+    alpha  = 0.1, # 초기 알파 값
+    delta  = 0.1, # 초기 델타 값
+    iter   = 5000, # Gibbs iteration 반복 횟수
+    thin   = 2000, # 중간에 생략 된 Gibbs 반복 횟수, 기본적으로 iter와 같습니다.
+    burnin = 0) # 처음에 생략 된 Gibbs 반복 횟수
+  
+  # Gibbs방식을 이용한 LDA, k = topic 숫자                         
+  lda_tm = LDA(dtm, k, method = "Gibbs", control = control_LDA_Gibbs)
+  
+  # 토픽별 핵심단어 30개 저장하기
+  term_topic = terms(lda_tm, 30)
+  
+  print(term_topic)
+}
+
+load(file = 'lda_tm.RData')
+
+term_topic = terms(lda_tm, 30)
+
+print(term_topic)
+```
+
+#### LDA 시각화
+```{r}
+# 문서별 토픽 번호 저장하기
+doc_topic = topics(lda_tm, 1)
+doc_topic_df = as.data.frame(doc_topic)
+doc_topic_df$name = dtm_clean$dimnames$Docs
+  
+# 문서별 토픽 확률값 계산하기
+doc_Prob = posterior(lda_tm)$topics
+doc_Prob_df = as.data.frame(doc_Prob)
+
+# 최대 확률값 찾기
+doc_Prob_df$maxProb = apply(doc_Prob_df, 1, max)
+  
+
+#문서별 토픽번호 및 확률값 추출하기
+doc_Prob_df$name = doc_topic_df$name # 확률 데이터 프레임에도 나중에 조인을 위해 영화를 할당해준다
+  
+id_topic = merge(doc_topic_df, doc_Prob_df, by = "name")
+
+head(id_topic, 10)
+```
+```{r}
+# LDA 시각화 
+phi = posterior(lda_tm)$term %>% as.matrix
+
+theta = posterior(lda_tm)$topics %>% as.matrix
+
+# vocab는 전체 단어 리스트 입니다.
+vocab = colnames(phi)
+
+# 각 단어별 빈도수를 구합니다.
+new_dtm = as.matrix(dtm_clean)
+freq_matrix = data.frame(word = colnames(new_dtm),
+                          Freq = colSums(new_dtm))
+
+freq_matrix %>% 
+  arrange(desc(Freq)) %>% 
+  head(10) %>% 
+  ggplot(mapping = aes(x = reorder(word, -Freq), y = Freq, fill = word)) +
+  geom_bar(stat = "identity") +
+  ggthemes::theme_wsj()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+## **5. 추천시스템 및 결론**
+
+#### 추천 시스템 
+```{r}
+# 랜덤으로 20명 단어 파싱 
+load(file = 'dtm_clean_userDT.RData')
+
+# 토픽별 단어 data.frame()
+load(file = 'lda_DT.RData')
+
+# user별 고빈도 사용단어 추출 후, 토픽 추천함수
+# user별  1번 이상 사용단어 logical형태로 추출
+
+# Random으로 1명 무작위 추출 
+sample_userN <- sample(rownames(dtm_clean_user), 1)
+sample_userN
+
+dtm_clean_user_index <- dtm_clean_user[rownames(dtm_clean_user) == sample_userN,] > 0
+a <- dtm_clean_user[rownames(dtm_clean_user) == sample_userN, dtm_clean_user_index]
+a
+
+b <- colnames(a)
+b
+
+# user별 단어 추출 후 lda_dt와 비교해서 토픽 뽑기
+max <- Inf
+for(j in 1:20){
+  sum <- 0
+  for(i in 1:7235){
+    if(lda_DT[i,j] %in% b){
+      sum <- sum + i * 1 / a[lda_DT[i, j] %>% as.character()]
+      av <- sum / length(b)
+    }
+  }
+  if(av < max){
+    topic <-  colnames(lda_DT)[j]
+    max <- av
+  }
+}
+  
+# lda_tm 각 토픽별로 포함되는 영화 추출하기
+doc_topic = topics(lda_tm, 1)
+doc_topic_df = as.data.frame(doc_topic)
+doc_topic_df$name = dtm_clean$dimnames$Docs
+doc_topic_df <- doc_topic_df[,c(2,1)]
+  
+# 정규표현식 이용하여 나온 토픽의 숫자만 남기기
+topic <- topic %>% str_extract(pattern = '\\d+')
+  
+# 토픽별 추천 영화 뽑기
+Re_MN <- doc_topic_df %>% 
+  dplyr::filter(doc_topic == topic) %>% 
+  head(5) %>% 
+  select(name) %>% as.vector()
+
+cat(sample_userN, '님께 추천해드리는 영화는 아래와 같습니다.\n')
+print(Re_MN$name)
+  
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
